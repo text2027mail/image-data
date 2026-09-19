@@ -1,34 +1,45 @@
 #!/usr/bin/env python3
 
 """
-BFILMY Movie Poster Downloader
-==============================
+BFILMY Production Movie Poster Pipeline
+=======================================
 
-Source:
-https://raw.githubusercontent.com/unknownman2024/bms-interest-track/main/Bookmyshow%20Data/moviesdb.json
+SOURCE:
+moviesdb.json
 
-Output:
+OUTPUT:
 images/<movie-slug>.jpg
 
-Production features:
-- 2,000+ movie support
-- Incremental downloads
-- Existing posters are NOT fetched again
-- Only new/changed/missing posters are downloaded
-- Persistent manifest
-- 20 KB hard file-size limit
-- Highest possible JPEG quality under 20 KB
-- Progressive resizing only when necessary
-- 32 concurrent downloads
-- Connection pooling
-- Automatic retries
-- Exponential backoff
-- Atomic file writes
-- Corrupt-file detection
-- Duplicate slug handling
-- UTF-8 BOM support
-- CDN/HTML error diagnostics
-- GitHub Actions friendly
+IMAGE:
+400x600 portrait (40:60 / 2:3)
+
+MAX SIZE:
+20 KB
+
+BEHAVIOUR:
+
+1. Fetch moviesdb.json once.
+2. Check local manifest/files.
+3. Existing valid poster:
+      -> SKIP
+      -> NO BMS REQUEST
+
+4. New movie:
+      -> Download BMS poster
+
+5. BMS poster download fails:
+      -> Generate BFILMY fallback poster
+      -> Save it
+      -> Do NOT retry every run
+
+6. Poster URL changes:
+      -> Download new poster
+
+7. Existing fallback:
+      -> SKIP
+      -> NO BMS REQUEST
+
+8. GitHub Actions stages ALL files and pushes them.
 """
 
 from __future__ import annotations
@@ -49,7 +60,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -67,43 +78,70 @@ SOURCE_URL = (
     "moviesdb.json"
 )
 
+LOGO_URL = (
+    "https://bfilmy.pages.dev/newlogo.png"
+)
+
 OUTPUT_DIR = Path("images")
 
 MANIFEST_FILE = Path(
     "poster-manifest.json"
 )
 
-# Hard maximum image size.
+# ------------------------------------------------------------
+# Image size
+# 40:60 = 2:3
+# ------------------------------------------------------------
+
+POSTER_WIDTH = 400
+POSTER_HEIGHT = 600
+
+# ------------------------------------------------------------
+# Maximum output size
+# ------------------------------------------------------------
+
 MAX_FILE_SIZE = 20 * 1024
 
-# Number of simultaneous image downloads.
+# ------------------------------------------------------------
+# Concurrent downloads
+# ------------------------------------------------------------
+
 WORKERS = 32
 
-# HTTP timeout.
+# ------------------------------------------------------------
+# HTTP
+# ------------------------------------------------------------
+
 CONNECT_TIMEOUT = 10
 READ_TIMEOUT = 30
 
-# Retry settings.
 MAX_RETRIES = 4
 BACKOFF_FACTOR = 0.5
 
-# JPEG quality range.
+# ------------------------------------------------------------
+# JPEG quality
+# ------------------------------------------------------------
+
 MIN_QUALITY = 25
 MAX_QUALITY = 95
 
-# If quality 25 still cannot fit under 20 KB,
-# reduce dimensions by this percentage.
+# ------------------------------------------------------------
+# Resize
+# ------------------------------------------------------------
+
 RESIZE_FACTOR = 0.90
 
-# Never resize below these dimensions.
 MIN_WIDTH = 120
 MIN_HEIGHT = 180
 
-# Protection against huge images.
 MAX_PIXELS = 20_000_000
 
+# ------------------------------------------------------------
+# User agent
+# ------------------------------------------------------------
+
 USER_AGENT = (
-    "BFILMY-Poster-Downloader/3.0 "
+    "BFILMY-Poster-Downloader/4.0 "
     "(production)"
 )
 
@@ -131,14 +169,6 @@ logger = logging.getLogger(
 # ============================================================
 
 def create_session() -> requests.Session:
-    """
-    Creates a requests session with:
-
-    - Connection pooling
-    - Automatic retries
-    - Backoff
-    - 429/5xx handling
-    """
 
     session = requests.Session()
 
@@ -215,13 +245,11 @@ def slugify(
         value or ""
     ).strip()
 
-    # Normalize Unicode.
     value = unicodedata.normalize(
         "NFKD",
         value,
     )
 
-    # Remove accents.
     value = value.encode(
         "ascii",
         "ignore",
@@ -231,35 +259,32 @@ def slugify(
 
     value = value.lower()
 
-    # & -> and
     value = value.replace(
         "&",
         " and ",
     )
 
-    # Don't create extra hyphens for apostrophes.
     value = value.replace(
         "'",
         "",
     )
 
-    # Everything else -> hyphen.
     value = re.sub(
         r"[^a-z0-9]+",
         "-",
         value,
     )
 
-    # Remove duplicate hyphens.
     value = re.sub(
         r"-+",
         "-",
         value,
     )
 
-    return value.strip(
-        "-"
-    ) or "movie"
+    return (
+        value.strip("-")
+        or "movie"
+    )
 
 
 # ============================================================
@@ -267,14 +292,8 @@ def slugify(
 # ============================================================
 
 def load_manifest() -> dict[str, Any]:
-    """
-    Loads the local poster manifest.
-
-    If it doesn't exist, this is the first run.
-    """
 
     if not MANIFEST_FILE.exists():
-
         return {}
 
     try:
@@ -290,11 +309,6 @@ def load_manifest() -> dict[str, Any]:
             data,
             dict,
         ):
-
-            logger.warning(
-                "Manifest root isn't an object."
-            )
-
             return {}
 
         return data
@@ -302,7 +316,7 @@ def load_manifest() -> dict[str, Any]:
     except Exception as exc:
 
         logger.warning(
-            "Could not load manifest: %s",
+            "Manifest load failed: %s",
             exc,
         )
 
@@ -312,14 +326,6 @@ def load_manifest() -> dict[str, Any]:
 def save_manifest(
     manifest: dict[str, Any],
 ) -> None:
-    """
-    Atomic manifest write.
-    """
-
-    MANIFEST_FILE.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
 
     temp = MANIFEST_FILE.with_suffix(
         ".tmp"
@@ -341,24 +347,12 @@ def save_manifest(
 
 
 # ============================================================
-# DOWNLOAD DATABASE
+# DATABASE
 # ============================================================
 
 def download_database(
     session: requests.Session,
 ) -> dict[str, Any]:
-    """
-    Downloads and parses moviesdb.json.
-
-    Does NOT use response.json() directly.
-
-    This handles:
-    - UTF-8 BOM
-    - CDN/proxy responses
-    - Incorrect Content-Type
-    - HTML error responses
-    - Empty responses
-    """
 
     logger.info(
         "Fetching moviesdb.json..."
@@ -380,7 +374,7 @@ def download_database(
     if not raw:
 
         raise ValueError(
-            "Source returned an empty response"
+            "moviesdb.json returned empty response"
         )
 
     logger.info(
@@ -398,21 +392,8 @@ def download_database(
 
     logger.info(
         "Source size        : %.2f MB",
-        len(raw) / (
-            1024 * 1024
-        ),
+        len(raw) / (1024 * 1024),
     )
-
-    logger.info(
-        "Source final URL   : %s",
-        response.url,
-    )
-
-    # --------------------------------------------------------
-    # Decode UTF-8.
-    #
-    # utf-8-sig automatically removes a BOM if present.
-    # --------------------------------------------------------
 
     try:
 
@@ -423,7 +404,7 @@ def download_database(
     except UnicodeDecodeError as exc:
 
         raise ValueError(
-            f"Source is not valid UTF-8: {exc}"
+            "moviesdb.json is not UTF-8"
         ) from exc
 
     text = text.strip()
@@ -431,12 +412,8 @@ def download_database(
     if not text:
 
         raise ValueError(
-            "Source returned empty text"
+            "moviesdb.json is empty"
         )
-
-    # --------------------------------------------------------
-    # JSON parse
-    # --------------------------------------------------------
 
     try:
 
@@ -445,14 +422,6 @@ def download_database(
         )
 
     except json.JSONDecodeError as exc:
-
-        preview = (
-            text[:1000]
-            .replace(
-                "\n",
-                "\\n",
-            )
-        )
 
         logger.error(
             "JSON parsing failed."
@@ -464,17 +433,15 @@ def download_database(
 
         logger.error(
             "%s",
-            preview,
+            text[:1000].replace(
+                "\n",
+                "\\n",
+            ),
         )
 
         raise ValueError(
-            "moviesdb.json response "
-            "is not valid JSON"
+            "moviesdb.json is not valid JSON"
         ) from exc
-
-    # --------------------------------------------------------
-    # Validate root
-    # --------------------------------------------------------
 
     if not isinstance(
         data,
@@ -482,8 +449,7 @@ def download_database(
     ):
 
         raise ValueError(
-            "moviesdb.json root "
-            "must be an object"
+            "moviesdb.json root must be an object"
         )
 
     logger.info(
@@ -501,19 +467,8 @@ def download_database(
 def normalize_movies(
     data: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """
-    Converts:
 
-        {
-            "ET00002396": {...}
-        }
-
-    into a normalized list.
-    """
-
-    movies: list[
-        dict[str, Any]
-    ] = []
+    movies = []
 
     for movie_code, movie in data.items():
 
@@ -521,10 +476,9 @@ def normalize_movies(
             movie,
             dict,
         ):
-
             continue
 
-        movie_name = str(
+        name = str(
             movie.get(
                 "movieName"
             ) or ""
@@ -536,14 +490,7 @@ def normalize_movies(
             ) or ""
         ).strip()
 
-        if not movie_name:
-
-            logger.warning(
-                "Skipping %s: "
-                "missing movieName",
-                movie_code,
-            )
-
+        if not name:
             continue
 
         if not poster.startswith(
@@ -552,14 +499,6 @@ def normalize_movies(
                 "https://",
             )
         ):
-
-            logger.warning(
-                "Skipping %s (%s): "
-                "invalid poster URL",
-                movie_code,
-                movie_name,
-            )
-
             continue
 
         movies.append({
@@ -567,12 +506,12 @@ def normalize_movies(
                 movie_code
             ),
 
-            "movieName": movie_name,
+            "movieName": name,
 
             "poster": poster,
 
             "slug": slugify(
-                movie_name
+                name
             ),
 
             "releaseDate": movie.get(
@@ -580,7 +519,6 @@ def normalize_movies(
             ),
         })
 
-    # Deterministic order.
     movies.sort(
         key=lambda x: (
             x["slug"],
@@ -589,21 +527,20 @@ def normalize_movies(
     )
 
     # --------------------------------------------------------
-    # Duplicate slug handling
+    # Duplicate slug protection
     # --------------------------------------------------------
 
-    used_slugs: dict[
-        str,
-        str
-    ] = {}
+    used = {}
 
     for movie in movies:
 
-        slug = movie["slug"]
+        slug = movie[
+            "slug"
+        ]
 
-        if slug not in used_slugs:
+        if slug not in used:
 
-            used_slugs[
+            used[
                 slug
             ] = movie[
                 "movieCode"
@@ -611,12 +548,9 @@ def normalize_movies(
 
             continue
 
-        # Example:
-        #
-        # movie-name.jpg
-        # movie-name-et123456.jpg
-
-        movie["slug"] = (
+        movie[
+            "slug"
+        ] = (
             f"{slug}-"
             f"{slugify(movie['movieCode'])}"
         )
@@ -625,16 +559,12 @@ def normalize_movies(
 
 
 # ============================================================
-# EXISTING FILE VALIDATION
+# VALIDATE LOCAL IMAGE
 # ============================================================
 
 def is_valid_existing_file(
     path: Path,
 ) -> bool:
-    """
-    Checks an existing poster without
-    making a network request.
-    """
 
     try:
 
@@ -646,15 +576,15 @@ def is_valid_existing_file(
 
         size = path.stat().st_size
 
-        # Empty or over 20 KB.
         if size <= 0:
             return False
 
         if size > MAX_FILE_SIZE:
             return False
 
-        # Validate actual JPEG.
-        with Image.open(path) as image:
+        with Image.open(
+            path
+        ) as image:
 
             image.verify()
 
@@ -676,15 +606,6 @@ def should_download(
     bool,
     str,
 ]:
-    """
-    Determines whether this poster needs
-    to be downloaded.
-
-    IMPORTANT:
-
-    A valid cached poster produces ZERO
-    poster network requests.
-    """
 
     movie_code = movie[
         "movieCode"
@@ -704,10 +625,7 @@ def should_download(
     )
 
     # --------------------------------------------------------
-    # BEST CASE
-    #
-    # Manifest says the local file was generated
-    # from the same poster URL.
+    # Existing valid file
     # --------------------------------------------------------
 
     if (
@@ -731,11 +649,7 @@ def should_download(
         )
 
     # --------------------------------------------------------
-    # Existing file but no manifest.
-    #
-    # Useful when upgrading from an older version.
-    #
-    # We don't unnecessarily download it.
+    # Existing file with no manifest
     # --------------------------------------------------------
 
     if (
@@ -762,7 +676,7 @@ def should_download(
         )
 
     # --------------------------------------------------------
-    # URL changed
+    # Poster URL changed
     # --------------------------------------------------------
 
     if previous:
@@ -786,7 +700,7 @@ def should_download(
             )
 
     # --------------------------------------------------------
-    # Invalid / oversized
+    # Invalid file
     # --------------------------------------------------------
 
     return (
@@ -796,7 +710,7 @@ def should_download(
 
 
 # ============================================================
-# DOWNLOAD POSTER
+# DOWNLOAD IMAGE
 # ============================================================
 
 def download_image(
@@ -820,7 +734,7 @@ def download_image(
     if not data:
 
         raise ValueError(
-            "Poster returned empty response"
+            "Empty poster response"
         )
 
     return data
@@ -834,7 +748,6 @@ def open_image(
     raw: bytes,
 ) -> Image.Image:
 
-    # Prevent enormous source responses.
     if len(raw) > (
         15 * 1024 * 1024
     ):
@@ -847,7 +760,6 @@ def open_image(
         io.BytesIO(raw)
     )
 
-    # Force decode.
     image.load()
 
     if (
@@ -856,16 +768,13 @@ def open_image(
     ) > MAX_PIXELS:
 
         raise ValueError(
-            "Image exceeds maximum "
-            "pixel count"
+            "Image exceeds pixel limit"
         )
 
-    # Respect EXIF orientation.
     image = ImageOps.exif_transpose(
         image
     )
 
-    # Convert to RGB.
     if image.mode != "RGB":
 
         if "A" in image.getbands():
@@ -895,7 +804,7 @@ def open_image(
 
 
 # ============================================================
-# JPEG ENCODE
+# JPEG ENCODING
 # ============================================================
 
 def encode_jpeg(
@@ -918,7 +827,7 @@ def encode_jpeg(
 
 
 # ============================================================
-# HIGHEST QUALITY UNDER 20 KB
+# BEST QUALITY UNDER 20 KB
 # ============================================================
 
 def best_quality(
@@ -927,19 +836,6 @@ def best_quality(
     bytes,
     int,
 ]:
-    """
-    Binary-searches JPEG quality.
-
-    Returns the highest quality whose
-    output is <= 20 KB.
-
-    Much faster than trying every
-    quality level.
-    """
-
-    # --------------------------------------------------------
-    # Check maximum quality.
-    # --------------------------------------------------------
 
     encoded = encode_jpeg(
         image,
@@ -953,10 +849,6 @@ def best_quality(
             MAX_QUALITY,
         )
 
-    # --------------------------------------------------------
-    # Check minimum quality.
-    # --------------------------------------------------------
-
     encoded = encode_jpeg(
         image,
         MIN_QUALITY,
@@ -964,8 +856,6 @@ def best_quality(
 
     if len(encoded) > MAX_FILE_SIZE:
 
-        # Even Q25 is too large.
-        # Caller must resize.
         return (
             encoded,
             MIN_QUALITY,
@@ -993,12 +883,10 @@ def best_quality(
             best_data = encoded
             best_quality = quality
 
-            # Try higher quality.
             low = quality + 1
 
         else:
 
-            # Too large.
             high = quality - 1
 
     return (
@@ -1008,7 +896,7 @@ def best_quality(
 
 
 # ============================================================
-# COMPRESS TO <= 20 KB
+# COMPRESS REAL POSTER
 # ============================================================
 
 def compress_image(
@@ -1019,14 +907,76 @@ def compress_image(
     int,
     int,
 ]:
-    """
-    Attempts to preserve original dimensions.
 
-    Only resizes when Q25 cannot reach
-    the 20 KB limit.
-    """
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # We first resize to a reasonable portrait size.
+    #
+    # 400x600 is enough for your website while giving
+    # JPEG compression a much better chance to stay under
+    # 20 KB.
+    # --------------------------------------------------------
 
-    current = image
+    current = image.copy()
+
+    # Preserve aspect ratio.
+    ratio = min(
+        POSTER_WIDTH / current.width,
+        POSTER_HEIGHT / current.height,
+    )
+
+    new_width = max(
+        1,
+        int(current.width * ratio),
+    )
+
+    new_height = max(
+        1,
+        int(current.height * ratio),
+    )
+
+    current = current.resize(
+        (
+            new_width,
+            new_height,
+        ),
+        Image.Resampling.LANCZOS,
+    )
+
+    # Put into exact 400x600 canvas.
+    canvas = Image.new(
+        "RGB",
+        (
+            POSTER_WIDTH,
+            POSTER_HEIGHT,
+        ),
+        "black",
+    )
+
+    x = (
+        POSTER_WIDTH -
+        current.width
+    ) // 2
+
+    y = (
+        POSTER_HEIGHT -
+        current.height
+    ) // 2
+
+    canvas.paste(
+        current,
+        (
+            x,
+            y,
+        ),
+    )
+
+    current = canvas
+
+    # --------------------------------------------------------
+    # Find best quality.
+    # --------------------------------------------------------
 
     while True:
 
@@ -1036,7 +986,6 @@ def compress_image(
             )
         )
 
-        # Success.
         if len(encoded) <= MAX_FILE_SIZE:
 
             return (
@@ -1047,7 +996,7 @@ def compress_image(
             )
 
         # ----------------------------------------------------
-        # Need smaller dimensions.
+        # Still too large -> resize.
         # ----------------------------------------------------
 
         new_width = int(
@@ -1066,8 +1015,8 @@ def compress_image(
         ):
 
             raise ValueError(
-                "Unable to produce "
-                "poster under 20 KB"
+                "Unable to compress "
+                "poster below 20 KB"
             )
 
         current = current.resize(
@@ -1080,16 +1029,502 @@ def compress_image(
 
 
 # ============================================================
-# ATOMIC FILE WRITE
+# FONT
+# ============================================================
+
+def get_font(
+    size: int,
+    bold: bool = False,
+):
+
+    candidates = []
+
+    if bold:
+
+        candidates.extend([
+            "/usr/share/fonts/truetype/dejavu/"
+            "DejaVuSans-Bold.ttf",
+
+            "/usr/share/fonts/truetype/liberation2/"
+            "LiberationSans-Bold.ttf",
+        ])
+
+    else:
+
+        candidates.extend([
+            "/usr/share/fonts/truetype/dejavu/"
+            "DejaVuSans.ttf",
+
+            "/usr/share/fonts/truetype/liberation2/"
+            "LiberationSans-Regular.ttf",
+        ])
+
+    for path in candidates:
+
+        if Path(path).exists():
+
+            return ImageFont.truetype(
+                path,
+                size,
+            )
+
+    return ImageFont.load_default()
+
+
+# ============================================================
+# TEXT WRAPPING
+# ============================================================
+
+def wrap_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font,
+    max_width: int,
+) -> list[str]:
+
+    words = text.split()
+
+    if not words:
+        return ["Movie"]
+
+    lines = []
+    current = ""
+
+    for word in words:
+
+        test = (
+            word
+            if not current
+            else f"{current} {word}"
+        )
+
+        bbox = draw.textbbox(
+            (0, 0),
+            test,
+            font=font,
+        )
+
+        width = (
+            bbox[2] -
+            bbox[0]
+        )
+
+        if width <= max_width:
+
+            current = test
+
+        else:
+
+            if current:
+                lines.append(
+                    current
+                )
+
+            current = word
+
+    if current:
+        lines.append(
+            current
+        )
+
+    return lines
+
+
+# ============================================================
+# DOWNLOAD LOGO
+# ============================================================
+
+def download_logo(
+    session: requests.Session,
+) -> Image.Image | None:
+
+    try:
+
+        logger.info(
+            "Downloading BFILMY logo..."
+        )
+
+        response = session.get(
+            LOGO_URL,
+            timeout=(
+                CONNECT_TIMEOUT,
+                READ_TIMEOUT,
+            ),
+        )
+
+        response.raise_for_status()
+
+        image = Image.open(
+            io.BytesIO(
+                response.content
+            )
+        )
+
+        image.load()
+
+        image = ImageOps.exif_transpose(
+            image
+        )
+
+        if image.mode != "RGBA":
+
+            image = image.convert(
+                "RGBA"
+            )
+
+        return image
+
+    except Exception as exc:
+
+        logger.warning(
+            "Logo download failed: %s",
+            exc,
+        )
+
+        return None
+
+
+# ============================================================
+# FALLBACK POSTER
+# ============================================================
+
+def create_fallback_poster(
+    movie_name: str,
+    logo: Image.Image | None,
+) -> tuple[
+    bytes,
+    int,
+    int,
+    int,
+]:
+
+    width = POSTER_WIDTH
+    height = POSTER_HEIGHT
+
+    image = Image.new(
+        "RGB",
+        (
+            width,
+            height,
+        ),
+        "#090909",
+    )
+
+    draw = ImageDraw.Draw(
+        image
+    )
+
+    # --------------------------------------------------------
+    # Background
+    # --------------------------------------------------------
+
+    # Subtle vertical gradient.
+    for y in range(height):
+
+        value = int(
+            8 +
+            (
+                22 *
+                y /
+                height
+            )
+        )
+
+        draw.line(
+            [
+                (0, y),
+                (width, y),
+            ],
+            fill=(
+                value,
+                value,
+                value + 8,
+            ),
+        )
+
+    # --------------------------------------------------------
+    # Accent border
+    # --------------------------------------------------------
+
+    draw.rounded_rectangle(
+        (
+            12,
+            12,
+            width - 12,
+            height - 12,
+        ),
+        radius=18,
+        outline="#D92BFF",
+        width=3,
+    )
+
+    # --------------------------------------------------------
+    # Logo
+    # --------------------------------------------------------
+
+    if logo is not None:
+
+        logo_copy = logo.copy()
+
+        max_logo_width = 230
+        max_logo_height = 170
+
+        ratio = min(
+            max_logo_width /
+            logo_copy.width,
+
+            max_logo_height /
+            logo_copy.height,
+        )
+
+        logo_width = max(
+            1,
+            int(
+                logo_copy.width *
+                ratio
+            ),
+        )
+
+        logo_height = max(
+            1,
+            int(
+                logo_copy.height *
+                ratio
+            ),
+        )
+
+        logo_copy = logo_copy.resize(
+            (
+                logo_width,
+                logo_height,
+            ),
+            Image.Resampling.LANCZOS,
+        )
+
+        logo_x = (
+            width -
+            logo_width
+        ) // 2
+
+        logo_y = 45
+
+        image_rgba = image.convert(
+            "RGBA"
+        )
+
+        image_rgba.alpha_composite(
+            logo_copy,
+            (
+                logo_x,
+                logo_y,
+            ),
+        )
+
+        image = image_rgba.convert(
+            "RGB"
+        )
+
+        draw = ImageDraw.Draw(
+            image
+        )
+
+    # --------------------------------------------------------
+    # Movie name
+    # --------------------------------------------------------
+
+    name_font_size = 42
+
+    if len(movie_name) > 35:
+        name_font_size = 34
+
+    if len(movie_name) > 55:
+        name_font_size = 28
+
+    if len(movie_name) > 75:
+        name_font_size = 24
+
+    name_font = get_font(
+        name_font_size,
+        bold=True,
+    )
+
+    lines = wrap_text(
+        draw,
+        movie_name,
+        name_font,
+        330,
+    )
+
+    # Limit lines.
+    lines = lines[:5]
+
+    line_height = (
+        name_font_size + 10
+    )
+
+    total_height = (
+        len(lines) *
+        line_height
+    )
+
+    start_y = 300 - (
+        total_height // 2
+    )
+
+    for index, line in enumerate(
+        lines
+    ):
+
+        bbox = draw.textbbox(
+            (0, 0),
+            line,
+            font=name_font,
+        )
+
+        text_width = (
+            bbox[2] -
+            bbox[0]
+        )
+
+        x = (
+            width -
+            text_width
+        ) // 2
+
+        y = (
+            start_y +
+            index *
+            line_height
+        )
+
+        # Shadow.
+        draw.text(
+            (
+                x + 2,
+                y + 2,
+            ),
+            line,
+            font=name_font,
+            fill="#000000",
+        )
+
+        # Text.
+        draw.text(
+            (
+                x,
+                y,
+            ),
+            line,
+            font=name_font,
+            fill="#FFFFFF",
+        )
+
+    # --------------------------------------------------------
+    # Unavailable label
+    # --------------------------------------------------------
+
+    label_font = get_font(
+        19,
+        bold=True,
+    )
+
+    label = "POSTER UNAVAILABLE"
+
+    bbox = draw.textbbox(
+        (0, 0),
+        label,
+        font=label_font,
+    )
+
+    label_width = (
+        bbox[2] -
+        bbox[0]
+    )
+
+    label_x = (
+        width -
+        label_width
+    ) // 2
+
+    label_y = 470
+
+    draw.rounded_rectangle(
+        (
+            label_x - 18,
+            label_y - 10,
+            label_x +
+            label_width +
+            18,
+            label_y + 34,
+        ),
+        radius=10,
+        fill="#161616",
+        outline="#555555",
+        width=1,
+    )
+
+    draw.text(
+        (
+            label_x,
+            label_y,
+        ),
+        label,
+        font=label_font,
+        fill="#CCCCCC",
+    )
+
+    # --------------------------------------------------------
+    # BFILMY branding
+    # --------------------------------------------------------
+
+    brand_font = get_font(
+        17,
+        bold=True,
+    )
+
+    brand = "BFILMY"
+
+    bbox = draw.textbbox(
+        (0, 0),
+        brand,
+        font=brand_font,
+    )
+
+    brand_width = (
+        bbox[2] -
+        bbox[0]
+    )
+
+    draw.text(
+        (
+            (
+                width -
+                brand_width
+            ) // 2,
+            545,
+        ),
+        brand,
+        font=brand_font,
+        fill="#FFFFFF",
+    )
+
+    # --------------------------------------------------------
+    # Compress fallback
+    # --------------------------------------------------------
+
+    return compress_image(
+        image
+    )
+
+
+# ============================================================
+# ATOMIC WRITE
 # ============================================================
 
 def atomic_write(
     path: Path,
     data: bytes,
 ) -> None:
-    """
-    Prevents partially written images.
-    """
 
     path.parent.mkdir(
         parents=True,
@@ -1112,9 +1547,7 @@ def atomic_write(
         ) as f:
 
             f.write(data)
-
             f.flush()
-
             os.fsync(
                 f.fileno()
             )
@@ -1127,22 +1560,20 @@ def atomic_write(
     finally:
 
         try:
-
             os.unlink(
                 temp_name
             )
-
         except FileNotFoundError:
-
             pass
 
 
 # ============================================================
-# PROCESS ONE POSTER
+# PROCESS MOVIE
 # ============================================================
 
 def process_movie(
     movie: dict[str, Any],
+    logo: Image.Image | None,
 ) -> dict[str, Any]:
 
     output_path = (
@@ -1157,149 +1588,188 @@ def process_movie(
     try:
 
         # ----------------------------------------------------
-        # Download
+        # Try real BMS poster
         # ----------------------------------------------------
 
-        raw = download_image(
-            session,
-            movie["poster"],
-        )
+        try:
 
-        source_hash = hashlib.sha256(
-            raw
-        ).hexdigest()
-
-        # ----------------------------------------------------
-        # Decode
-        # ----------------------------------------------------
-
-        image = open_image(
-            raw
-        )
-
-        original_width = (
-            image.width
-        )
-
-        original_height = (
-            image.height
-        )
-
-        # ----------------------------------------------------
-        # Compress
-        # ----------------------------------------------------
-
-        (
-            encoded,
-            quality,
-            width,
-            height,
-        ) = compress_image(
-            image
-        )
-
-        if len(encoded) > MAX_FILE_SIZE:
-
-            raise ValueError(
-                f"Generated image "
-                f"is {len(encoded)} bytes"
+            raw = download_image(
+                session,
+                movie["poster"],
             )
 
-        # ----------------------------------------------------
-        # Write
-        # ----------------------------------------------------
+            source_hash = hashlib.sha256(
+                raw
+            ).hexdigest()
 
-        atomic_write(
-            output_path,
-            encoded,
-        )
+            image = open_image(
+                raw
+            )
 
-        elapsed = (
-            time.perf_counter()
-            - started
-        )
+            (
+                encoded,
+                quality,
+                width,
+                height,
+            ) = compress_image(
+                image
+            )
 
-        return {
-            "movieCode": movie[
-                "movieCode"
-            ],
+            if len(encoded) > MAX_FILE_SIZE:
 
-            "movieName": movie[
-                "movieName"
-            ],
+                raise ValueError(
+                    "Generated poster exceeds 20 KB"
+                )
 
-            "slug": movie[
-                "slug"
-            ],
+            atomic_write(
+                output_path,
+                encoded,
+            )
 
-            "poster": movie[
-                "poster"
-            ],
+            elapsed = (
+                time.perf_counter()
+                - started
+            )
 
-            "file": (
-                f"/images/"
-                f"{movie['slug']}.jpg"
-            ),
+            return {
+                "movieCode": movie[
+                    "movieCode"
+                ],
 
-            "size": len(encoded),
+                "movieName": movie[
+                    "movieName"
+                ],
 
-            "sizeKB": round(
-                len(encoded) / 1024,
-                2,
-            ),
+                "slug": movie[
+                    "slug"
+                ],
 
-            "quality": quality,
+                "poster": movie[
+                    "poster"
+                ],
 
-            "width": width,
+                "file": (
+                    f"/images/"
+                    f"{movie['slug']}.jpg"
+                ),
 
-            "height": height,
+                "size": len(encoded),
 
-            "originalWidth": (
-                original_width
-            ),
+                "sizeKB": round(
+                    len(encoded) / 1024,
+                    2,
+                ),
 
-            "originalHeight": (
-                original_height
-            ),
+                "quality": quality,
 
-            "sourceHash": source_hash,
+                "width": width,
 
-            "status": "downloaded",
+                "height": height,
 
-            "seconds": round(
-                elapsed,
-                3,
-            ),
-        }
+                "sourceHash": source_hash,
 
-    except Exception as exc:
+                "type": "original",
 
-        return {
-            "movieCode": movie[
-                "movieCode"
-            ],
+                "status": "downloaded",
 
-            "movieName": movie[
-                "movieName"
-            ],
+                "seconds": round(
+                    elapsed,
+                    3,
+                ),
+            }
 
-            "slug": movie[
-                "slug"
-            ],
+        except Exception as poster_error:
 
-            "poster": movie[
-                "poster"
-            ],
+            # ------------------------------------------------
+            # BMS poster failed.
+            #
+            # Generate local fallback.
+            # ------------------------------------------------
 
-            "file": (
-                f"/images/"
-                f"{movie['slug']}.jpg"
-            ),
+            logger.warning(
+                "BMS poster failed | %s | %s",
+                movie[
+                    "movieName"
+                ],
+                poster_error,
+            )
 
-            "status": "failed",
+            (
+                fallback,
+                quality,
+                width,
+                height,
+            ) = create_fallback_poster(
+                movie[
+                    "movieName"
+                ],
+                logo,
+            )
 
-            "error": str(exc),
-        }
+            if len(fallback) > MAX_FILE_SIZE:
+
+                raise ValueError(
+                    "Fallback poster exceeds 20 KB"
+                )
+
+            atomic_write(
+                output_path,
+                fallback,
+            )
+
+            elapsed = (
+                time.perf_counter()
+                - started
+            )
+
+            return {
+                "movieCode": movie[
+                    "movieCode"
+                ],
+
+                "movieName": movie[
+                    "movieName"
+                ],
+
+                "slug": movie[
+                    "slug"
+                ],
+
+                "poster": movie[
+                    "poster"
+                ],
+
+                "file": (
+                    f"/images/"
+                    f"{movie['slug']}.jpg"
+                ),
+
+                "size": len(fallback),
+
+                "sizeKB": round(
+                    len(fallback) / 1024,
+                    2,
+                ),
+
+                "quality": quality,
+
+                "width": width,
+
+                "height": height,
+
+                "type": "fallback",
+
+                "fallbackReason": str(
+                    poster_error
+                ),
+
+                "status": "fallback",
+
+                "seconds": round(
+                    elapsed,
+                    3,
+                ),
+            }
 
     finally:
 
@@ -1326,10 +1796,6 @@ def main() -> int:
         "=========================================="
     )
 
-    # --------------------------------------------------------
-    # Create directories
-    # --------------------------------------------------------
-
     OUTPUT_DIR.mkdir(
         parents=True,
         exist_ok=True,
@@ -1347,7 +1813,7 @@ def main() -> int:
     )
 
     # --------------------------------------------------------
-    # Fetch database
+    # Database
     # --------------------------------------------------------
 
     session = create_session()
@@ -1372,7 +1838,7 @@ def main() -> int:
         session.close()
 
     # --------------------------------------------------------
-    # Normalize movies
+    # Normalize
     # --------------------------------------------------------
 
     movies = normalize_movies(
@@ -1393,19 +1859,37 @@ def main() -> int:
     )
 
     # --------------------------------------------------------
-    # Determine required downloads
+    # Download logo ONCE
     # --------------------------------------------------------
 
-    to_download: list[
-        dict[str, Any]
-    ] = []
+    session = create_session()
+
+    try:
+
+        logo = download_logo(
+            session
+        )
+
+    finally:
+
+        session.close()
+
+    if logo is None:
+
+        logger.warning(
+            "BFILMY logo unavailable. "
+            "Fallback posters will use text branding."
+        )
+
+    # --------------------------------------------------------
+    # Determine delta
+    # --------------------------------------------------------
+
+    to_process = []
 
     cached = 0
 
-    reasons: dict[
-        str,
-        int
-    ] = {}
+    reasons = {}
 
     for movie in movies:
 
@@ -1418,13 +1902,17 @@ def main() -> int:
 
         if needs_download:
 
-            movie["_reason"] = reason
+            movie[
+                "_reason"
+            ] = reason
 
-            to_download.append(
+            to_process.append(
                 movie
             )
 
-            reasons[reason] = (
+            reasons[
+                reason
+            ] = (
                 reasons.get(
                     reason,
                     0,
@@ -1435,25 +1923,17 @@ def main() -> int:
 
             cached += 1
 
-    # --------------------------------------------------------
-    # Statistics
-    # --------------------------------------------------------
-
     logger.info(
         "Already cached : %d",
         cached,
     )
 
     logger.info(
-        "Need download  : %d",
-        len(to_download),
+        "Need process   : %d",
+        len(to_process),
     )
 
     if reasons:
-
-        logger.info(
-            "Download reasons:"
-        )
 
         for reason, count in sorted(
             reasons.items()
@@ -1466,21 +1946,20 @@ def main() -> int:
             )
 
     # --------------------------------------------------------
-    # Nothing changed
+    # Nothing to do
     # --------------------------------------------------------
 
-    if not to_download:
+    if not to_process:
 
         logger.info(
             "Everything is already up to date."
         )
 
         logger.info(
-            "ZERO poster downloads required."
+            "ZERO poster requests."
         )
 
-        # Ensure all existing movies have
-        # manifest entries.
+        # Refresh manifest metadata.
         for movie in movies:
 
             output_path = (
@@ -1488,72 +1967,69 @@ def main() -> int:
                 f"{movie['slug']}.jpg"
             )
 
-            if is_valid_existing_file(
+            if not is_valid_existing_file(
                 output_path
             ):
+                continue
 
-                previous = manifest.get(
-                    movie[
-                        "movieCode"
-                    ],
-                    {},
-                )
+            previous = manifest.get(
+                movie[
+                    "movieCode"
+                ],
+                {},
+            )
 
-                manifest[
-                    movie[
-                        "movieCode"
-                    ]
-                ] = {
-                    **previous,
+            manifest[
+                movie[
+                    "movieCode"
+                ]
+            ] = {
+                **previous,
 
-                    "movieCode": movie[
-                        "movieCode"
-                    ],
+                "movieCode": movie[
+                    "movieCode"
+                ],
 
-                    "movieName": movie[
-                        "movieName"
-                    ],
+                "movieName": movie[
+                    "movieName"
+                ],
 
-                    "slug": movie[
-                        "slug"
-                    ],
+                "slug": movie[
+                    "slug"
+                ],
 
-                    "poster": movie[
-                        "poster"
-                    ],
+                "poster": movie[
+                    "poster"
+                ],
 
-                    "file": (
-                        f"/images/"
-                        f"{movie['slug']}.jpg"
-                    ),
+                "file": (
+                    f"/images/"
+                    f"{movie['slug']}.jpg"
+                ),
 
-                    "size": output_path.stat().st_size,
+                "size": output_path.stat().st_size,
 
-                    "sizeKB": round(
-                        output_path.stat().st_size
-                        / 1024,
-                        2,
-                    ),
-                }
+                "sizeKB": round(
+                    output_path.stat().st_size
+                    / 1024,
+                    2,
+                ),
+            }
 
         save_manifest(
             manifest
         )
 
-        elapsed = (
-            time.perf_counter()
-            - started
-        )
-
         logger.info(
             "Completed in %.2f seconds.",
-            elapsed,
+            time.perf_counter()
+            - started,
         )
 
         return 0
 
     # --------------------------------------------------------
-    # Download only delta
+    # Process only delta
     # --------------------------------------------------------
 
     logger.info(
@@ -1561,8 +2037,8 @@ def main() -> int:
         WORKERS,
     )
 
-    downloaded = 0
-    failed = 0
+    original_count = 0
+    fallback_count = 0
 
     with ThreadPoolExecutor(
         max_workers=WORKERS
@@ -1572,8 +2048,9 @@ def main() -> int:
             executor.submit(
                 process_movie,
                 movie,
+                logo,
             ): movie
-            for movie in to_download
+            for movie in to_process
         }
 
         for future in as_completed(
@@ -1590,54 +2067,30 @@ def main() -> int:
 
             except Exception as exc:
 
-                result = {
-                    "movieCode": movie[
-                        "movieCode"
-                    ],
-
-                    "movieName": movie[
+                logger.error(
+                    "Worker failed | %s | %s",
+                    movie[
                         "movieName"
                     ],
+                    exc,
+                )
 
-                    "slug": movie[
-                        "slug"
-                    ],
-
-                    "poster": movie[
-                        "poster"
-                    ],
-
-                    "file": (
-                        f"/images/"
-                        f"{movie['slug']}.jpg"
-                    ),
-
-                    "status": "failed",
-
-                    "error": str(exc),
-                }
+                continue
 
             # ------------------------------------------------
-            # Successful
+            # ORIGINAL
             # ------------------------------------------------
 
             if result[
-                "status"
-            ] == "downloaded":
+                "type"
+            ] == "original":
 
-                downloaded += 1
-
-                manifest[
-                    movie[
-                        "movieCode"
-                    ]
-                ] = result
+                original_count += 1
 
                 logger.info(
-                    "OK | "
+                    "ORIGINAL | "
                     "%6.2f KB | "
                     "Q%-2d | "
-                    "%4dx%-4d | "
                     "%s",
 
                     result[
@@ -1648,12 +2101,26 @@ def main() -> int:
                         "quality"
                     ],
 
-                    result[
-                        "width"
-                    ],
+                    movie[
+                        "movieName"
+                    ][:60],
+                )
+
+            # ------------------------------------------------
+            # FALLBACK
+            # ------------------------------------------------
+
+            else:
+
+                fallback_count += 1
+
+                logger.warning(
+                    "FALLBACK | "
+                    "%6.2f KB | "
+                    "%s",
 
                     result[
-                        "height"
+                        "sizeKB"
                     ],
 
                     movie[
@@ -1662,28 +2129,17 @@ def main() -> int:
                 )
 
             # ------------------------------------------------
-            # Failed
+            # Save result
             # ------------------------------------------------
 
-            else:
-
-                failed += 1
-
-                logger.error(
-                    "FAILED | %s | %s",
-
-                    movie[
-                        "movieName"
-                    ],
-
-                    result.get(
-                        "error",
-                        "unknown error",
-                    ),
-                )
+            manifest[
+                movie[
+                    "movieCode"
+                ]
+            ] = result
 
     # --------------------------------------------------------
-    # Refresh manifest for all valid local files
+    # Refresh manifest
     # --------------------------------------------------------
 
     for movie in movies:
@@ -1699,7 +2155,7 @@ def main() -> int:
 
             continue
 
-        existing = manifest.get(
+        previous = manifest.get(
             movie[
                 "movieCode"
             ],
@@ -1711,7 +2167,7 @@ def main() -> int:
                 "movieCode"
             ]
         ] = {
-            **existing,
+            **previous,
 
             "movieCode": movie[
                 "movieCode"
@@ -1744,7 +2200,7 @@ def main() -> int:
         }
 
     # --------------------------------------------------------
-    # Save manifest
+    # Save
     # --------------------------------------------------------
 
     save_manifest(
@@ -1756,18 +2212,13 @@ def main() -> int:
         - started
     )
 
-    # --------------------------------------------------------
-    # Final summary
-    # --------------------------------------------------------
-
     logger.info("")
-
     logger.info(
         "=========================================="
     )
 
     logger.info(
-        "COMPLETE"
+        "BFILMY POSTER PIPELINE COMPLETE"
     )
 
     logger.info(
@@ -1785,13 +2236,13 @@ def main() -> int:
     )
 
     logger.info(
-        "Downloaded     : %d",
-        downloaded,
+        "Original       : %d",
+        original_count,
     )
 
     logger.info(
-        "Failed         : %d",
-        failed,
+        "Fallback       : %d",
+        fallback_count,
     )
 
     logger.info(
@@ -1802,14 +2253,6 @@ def main() -> int:
     logger.info(
         "=========================================="
     )
-
-    # --------------------------------------------------------
-    # We don't fail the workflow because of a
-    # temporary BMS poster failure.
-    #
-    # The failed movie will be retried on the
-    # next workflow run.
-    # --------------------------------------------------------
 
     return 0
 
